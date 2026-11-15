@@ -1,0 +1,28 @@
+{
+  "name": "unblock-mcp-x402",
+  "version": "1.0.0",
+  "description": "Autonomous AI Agent Scraping Tool with x402 Micropayments on Base",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "deploy": "wrangler deploy",
+    "test": "node --test dist/**/*.test.js 2>/dev/null || ts-node tests/run.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "typescript": "^5.5.4",
+    "wrangler": "^3.114.17"
+  },
+  "overrides": {
+    "@fastify/busboy": "^3.2.2",
+    "ws": "^8.20.2",
+    "undici": "^6.21.1",
+    "esbuild": "^0.25.0",
+    "zod": "^4.6.7"
+  },
+  "license": "MIT"
+}

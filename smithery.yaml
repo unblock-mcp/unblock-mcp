@@ -1,0 +1,13 @@
+startCommand:
+  type: http
+  url: "https://unblock-mcp-x402.unblock-mcp.workers.dev/mcp"
+metadata:
+  name: "unblock-mcp-x402"
+  description: "Autonomous Agent Web Scraping Tool with x402 Micropayments on Base, Polygon, BSC, Arbitrum, and Solana ($0.005 USDC per call)"
+  tags:
+    - scraping
+    - anti-bot
+    - x402
+    - payments
+    - markdown
+    - multichain

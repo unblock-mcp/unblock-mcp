@@ -1,0 +1,20 @@
+name = "unblock-mcp-x402"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+PAYMENT_RECIPIENT_EVM = "0x0000000000000000000000000000000000000000" # Заменяется на ваш адрес кошелька Base
+PAYMENT_RECIPIENT_SOLANA = "" # Опциональный адрес Solana (SPL USDC)
+PAYMENT_AMOUNT_USDC = "0.005"
+UPSTREAM_STEALTH_GATEWAY = "https://api.scrapingbee.com/v1"
+UPSTREAM_API_KEY = ""
+
+# KV Namespaces для кэширования страниц и хранения Nonce (защита от повтора платежа)
+[[kv_namespaces]]
+binding = "NONCE_KV"
+id = "a193ff2bd55646daa5e807debc74f653"
+
+[[kv_namespaces]]
+binding = "CACHE_KV"
+id = "aa062e79370847e3b5bc487fd60d55f3"
