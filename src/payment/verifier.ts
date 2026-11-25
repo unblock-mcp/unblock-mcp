@@ -59,179 +59,193 @@ export async function verifyAndSettlePayment(
     return { valid: false, error: "Payment nonce is currently locked in-flight or already redeemed (replay attack rejected)." };
   }
   activeNonceLocks.add(nonce);
+  let committed = false;
 
-  // 2. Persistent Replay Protection: Check if this nonce was already redeemed in Edge KV
-  const nonceKey = `nonce:${nonce}`;
   try {
-    const existing = await env.NONCE_KV.get(nonceKey);
-    if (existing) {
-      return { valid: false, error: "Payment nonce has already been redeemed (replay attack rejected)." };
+    // 2. Fail-closed check for unconfigured recipient outside test mode
+    const isLocalTestMode = env.ENVIRONMENT === "test" && env.ALLOW_MOCK_PAYMENT === "true";
+    if (!isLocalTestMode && (!env.PAYMENT_RECIPIENT_EVM || /^0x0+$/.test(env.PAYMENT_RECIPIENT_EVM))) {
+      return {
+        valid: false,
+        error: "Server payment recipient is not configured (fail-closed hold mode).",
+      };
     }
-  } catch (err) {
-    console.warn("Nonce KV read error:", err);
-  }
 
-  // 2. Format validation
-  if (!signatureOrPayload || signatureOrPayload.length < 10) {
-    return { valid: false, error: "Invalid or empty payment signature payload." };
-  }
-
-  let payload: X402PaymentPayload | null = null;
-
-  // Try parsing structured JSON payload
-  if (signatureOrPayload.startsWith("{")) {
+    // 3. Persistent Replay Protection: Check if this nonce was already redeemed in Edge KV
+    const nonceKey = `nonce:${nonce}`;
     try {
-      payload = JSON.parse(signatureOrPayload) as X402PaymentPayload;
-    } catch {
-      return { valid: false, error: "Malformed JSON in payment payload." };
+      const existing = await env.NONCE_KV.get(nonceKey);
+      if (existing) {
+        return { valid: false, error: "Payment nonce has already been redeemed (replay attack rejected)." };
+      }
+    } catch (err) {
+      console.warn("Nonce KV read error:", err);
     }
-  }
 
-  // Handle explicit sandbox / development mock mode
-  if (!payload) {
-    const isHexSignature = /^0x[0-9a-fA-F]+$/.test(signatureOrPayload);
-    if (isHexSignature) {
-      if (env.ALLOW_MOCK_PAYMENT === "true" && env.ENVIRONMENT !== "production") {
-        console.warn("SANDBOX MODE: Allowing simulated mock signature for development testing.");
-        const simulatedTx = `0x${crypto.randomUUID().replace(/-/g, "")}`;
-        await commitNonce(env, nonceKey, "0xMockAgentSigner", "0.005", "base", simulatedTx);
+    // 4. Format validation (Strictly requires structured EIP-712 JSON payload)
+    if (!signatureOrPayload || signatureOrPayload.length < 10) {
+      return { valid: false, error: "Invalid or empty payment signature payload." };
+    }
+
+    let payload: X402PaymentPayload | null = null;
+    if (signatureOrPayload.startsWith("{")) {
+      try {
+        payload = JSON.parse(signatureOrPayload) as X402PaymentPayload;
+      } catch {
+        return { valid: false, error: "Malformed JSON in payment payload." };
+      }
+    }
+
+    if (!payload) {
+      return {
+        valid: false,
+        error: "Unsupported signature format. Complete EIP-712 JSON authorization payload is required.",
+      };
+    }
+
+    // 5. Validate authorization parameters
+    const auth = payload.authorization;
+    if (!auth) {
+      return { valid: false, error: "Missing 'authorization' structure in payment payload." };
+    }
+
+    if (auth.nonce !== nonce) {
+      return {
+        valid: false,
+        error: `Nonce mismatch: authorization nonce '${auth.nonce}' does not match challenge nonce '${nonce}'.`,
+      };
+    }
+
+    const expiresAtMs = Number(auth.expiresAt);
+    const now = Date.now();
+    if (isNaN(expiresAtMs) || expiresAtMs < now) {
+      return { valid: false, error: "Payment authorization has expired." };
+    }
+
+    if (expiresAtMs > now + PROTOCOL_CONFIG.SECURITY.MAX_CLOCK_SKEW_MS * 2) {
+      return { valid: false, error: "Payment authorization expiresAt timestamp is suspiciously far in the future." };
+    }
+
+    if (auth.recipient.toLowerCase() !== env.PAYMENT_RECIPIENT_EVM.toLowerCase()) {
+      return {
+        valid: false,
+        error: `Invalid recipient address: expected ${env.PAYMENT_RECIPIENT_EVM}, received ${auth.recipient}`,
+      };
+    }
+
+    const paidAmount = parseFloat(auth.amount);
+    const requiredAmount = parseFloat(env.PAYMENT_AMOUNT_USDC || PROTOCOL_CONFIG.DEFAULT_PRICE_USDC);
+    if (isNaN(paidAmount) || paidAmount < requiredAmount) {
+      return {
+        valid: false,
+        error: `Insufficient payment amount: received ${auth.amount}, required ${requiredAmount} USDC.`,
+      };
+    }
+
+    if (!isAddress(payload.signer)) {
+      return { valid: false, error: "Invalid signer EVM address format." };
+    }
+
+    if (!payload.signature || !payload.signature.startsWith("0x")) {
+      return { valid: false, error: "Invalid signature format: expected 0x-prefixed hex string." };
+    }
+
+    // 6. Resolve Target EVM Network
+    const networkKey = (payload.network || "base").toLowerCase();
+    const networkConfig = PROTOCOL_CONFIG.NETWORKS[networkKey as keyof typeof PROTOCOL_CONFIG.NETWORKS];
+    if (!networkConfig || networkConfig.type !== "evm") {
+      return { valid: false, error: `Unsupported or non-EVM network: '${payload.network}'.` };
+    }
+
+    // 7. Cryptographic EIP-712 Signature Verification via viem
+    try {
+      const domain = X402_EIP712_DOMAIN(networkConfig.chainId, networkConfig.usdcContract as `0x${string}`);
+
+      const isValidSig = await verifyTypedData({
+        address: getAddress(payload.signer),
+        domain,
+        types: X402_EIP712_TYPES,
+        primaryType: "PaymentAuthorization",
+        message: {
+          recipient: getAddress(auth.recipient),
+          amount: String(auth.amount),
+          currency: String(auth.currency),
+          nonce: String(auth.nonce),
+          expiresAt: BigInt(auth.expiresAt),
+        },
+        signature: payload.signature as Hex,
+      });
+
+      if (!isValidSig) {
         return {
-          valid: true,
-          signer: "0xMockAgentSigner",
-          txHash: simulatedTx,
+          valid: false,
+          error: "Cryptographic EIP-712 signature verification failed. Signature does not match signer and message.",
         };
       }
+    } catch (verifyErr) {
       return {
         valid: false,
-        error:
-          "Direct hex signature without structured authorization payload is rejected in production. Provide complete EIP-712 JSON payload.",
+        error: `Cryptographic verification error: ${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)}`,
       };
     }
-    return { valid: false, error: "Unsupported signature format. Expected EIP-712 JSON payload." };
-  }
 
-  // 3. Validate authorization parameters
-  const auth = payload.authorization;
-  if (!auth) {
-    return { valid: false, error: "Missing 'authorization' structure in payment payload." };
-  }
-
-  if (auth.nonce !== nonce) {
-    return {
-      valid: false,
-      error: `Nonce mismatch: authorization nonce '${auth.nonce}' does not match challenge nonce '${nonce}'.`,
-    };
-  }
-
-  const expiresAtMs = Number(auth.expiresAt);
-  const now = Date.now();
-  if (isNaN(expiresAtMs) || expiresAtMs < now) {
-    return { valid: false, error: "Payment authorization has expired." };
-  }
-
-  if (expiresAtMs > now + PROTOCOL_CONFIG.SECURITY.MAX_CLOCK_SKEW_MS * 2) {
-    return { valid: false, error: "Payment authorization expiresAt timestamp is suspiciously far in the future." };
-  }
-
-  if (auth.recipient.toLowerCase() !== env.PAYMENT_RECIPIENT_EVM.toLowerCase()) {
-    return {
-      valid: false,
-      error: `Invalid recipient address: expected ${env.PAYMENT_RECIPIENT_EVM}, received ${auth.recipient}`,
-    };
-  }
-
-  const paidAmount = parseFloat(auth.amount);
-  const requiredAmount = parseFloat(env.PAYMENT_AMOUNT_USDC || PROTOCOL_CONFIG.DEFAULT_PRICE_USDC);
-  if (isNaN(paidAmount) || paidAmount < requiredAmount) {
-    return {
-      valid: false,
-      error: `Insufficient payment amount: received ${auth.amount}, required ${requiredAmount} USDC.`,
-    };
-  }
-
-  if (!isAddress(payload.signer)) {
-    return { valid: false, error: "Invalid signer EVM address format." };
-  }
-
-  if (!payload.signature || !payload.signature.startsWith("0x")) {
-    return { valid: false, error: "Invalid signature format: expected 0x-prefixed hex string." };
-  }
-
-  // 4. Resolve Target EVM Network
-  const networkKey = (payload.network || "base").toLowerCase();
-  const networkConfig = PROTOCOL_CONFIG.NETWORKS[networkKey as keyof typeof PROTOCOL_CONFIG.NETWORKS];
-  if (!networkConfig || networkConfig.type !== "evm") {
-    return { valid: false, error: `Unsupported or non-EVM network: '${payload.network}'.` };
-  }
-
-  // 5. Cryptographic EIP-712 Signature Verification via viem
-  try {
-    const domain = X402_EIP712_DOMAIN(networkConfig.chainId, networkConfig.usdcContract as `0x${string}`);
-
-    const isValidSig = await verifyTypedData({
-      address: getAddress(payload.signer),
-      domain,
-      types: X402_EIP712_TYPES,
-      primaryType: "PaymentAuthorization",
-      message: {
-        recipient: getAddress(auth.recipient),
-        amount: String(auth.amount),
-        currency: String(auth.currency),
-        nonce: String(auth.nonce),
-        expiresAt: BigInt(auth.expiresAt),
-      },
-      signature: payload.signature as Hex,
-    });
-
-    if (!isValidSig) {
-      return {
-        valid: false,
-        error: "Cryptographic EIP-712 signature verification failed. Signature does not match signer and message.",
-      };
-    }
-  } catch (verifyErr) {
-    return {
-      valid: false,
-      error: `Cryptographic verification error: ${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)}`,
-    };
-  }
-
-  // 6. Optional Facilitator Settlement (Coinbase CDP)
-  let settledTxHash: string | undefined;
-  if (env.COINBASE_CDP_API_KEY) {
-    try {
-      const settleRes = await fetch("https://api.cdp.coinbase.com/platform/v2/x402/settle", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${env.COINBASE_CDP_API_KEY}`,
-        },
-        body: JSON.stringify({
-          network: networkKey,
-          payload,
-        }),
-      });
-      if (settleRes.ok) {
-        const settleData = (await settleRes.json()) as { txHash?: string };
-        settledTxHash = settleData.txHash;
+    // 8. On-Chain Settlement via Facilitator (Fail-closed outside sandbox)
+    let settledTxHash: string | undefined;
+    if (env.COINBASE_CDP_API_KEY) {
+      try {
+        const settleRes = await fetch("https://api.cdp.coinbase.com/platform/v2/x402/settle", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${env.COINBASE_CDP_API_KEY}`,
+          },
+          body: JSON.stringify({
+            network: networkKey,
+            payload,
+          }),
+          signal: AbortSignal.timeout(10000),
+        });
+        if (settleRes.ok) {
+          const settleData = (await settleRes.json()) as { txHash?: string };
+          settledTxHash = settleData.txHash;
+        } else {
+          return {
+            valid: false,
+            error: `Facilitator settlement rejected (HTTP ${settleRes.status}).`,
+          };
+        }
+      } catch (settleErr) {
+        return {
+          valid: false,
+          error: `Facilitator settlement request failed: ${settleErr instanceof Error ? settleErr.message : String(settleErr)}`,
+        };
       }
-    } catch (settleErr) {
-      console.warn("Coinbase CDP settlement warning (continuing with cryptographic proof):", settleErr);
+    } else if (!isLocalTestMode) {
+      // Fail-closed: prevents empty-wallet EIP-712 signatures from bypassing billing when no facilitator is configured
+      return {
+        valid: false,
+        error: "On-chain payment settlement facilitator is not configured (fail-closed).",
+      };
+    }
+
+    const txHash =
+      settledTxHash ||
+      `0x${crypto.createHash("sha256").update(payload.signature + nonce).digest("hex")}`;
+
+    // 9. Commit Nonce to KV (Anti-replay protection with 24h TTL)
+    await commitNonce(env, nonceKey, payload.signer, auth.amount, networkKey, txHash);
+    committed = true;
+
+    return {
+      valid: true,
+      signer: payload.signer,
+      txHash,
+    };
+  } finally {
+    if (!committed) {
+      activeNonceLocks.delete(nonce);
     }
   }
-
-  const txHash =
-    settledTxHash ||
-    `0x${crypto.createHash("sha256").update(payload.signature + nonce).digest("hex")}`;
-
-  // 7. Commit Nonce to KV (Anti-replay protection with 24h TTL)
-  await commitNonce(env, nonceKey, payload.signer, auth.amount, networkKey, txHash);
-
-  return {
-    valid: true,
-    signer: payload.signer,
-    txHash,
-  };
 }
 
 async function commitNonce(

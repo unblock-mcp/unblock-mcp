@@ -25,6 +25,16 @@ const mockEnv: Env = {
   PAYMENT_RECIPIENT_EVM: "0x1234567890123456789012345678901234567890",
   PAYMENT_RECIPIENT_SOLANA: "SolanaAddress111111111111111111111111111111111",
   PAYMENT_AMOUNT_USDC: "0.005",
+  ENVIRONMENT: "test",
+  ALLOW_MOCK_PAYMENT: "true",
+  NONCE_KV: new MockKV() as unknown as KVNamespace,
+  CACHE_KV: new MockKV() as unknown as KVNamespace,
+};
+
+const prodFailClosedEnv: Env = {
+  PAYMENT_RECIPIENT_EVM: "0x0000000000000000000000000000000000000000",
+  PAYMENT_AMOUNT_USDC: "0.005",
+  ENVIRONMENT: "production",
   NONCE_KV: new MockKV() as unknown as KVNamespace,
   CACHE_KV: new MockKV() as unknown as KVNamespace,
 };
@@ -174,6 +184,30 @@ async function runTests() {
   // 4c. Anti-Replay test: submitting the same nonce again must fail
   const replayRes = await handleJsonRpc(paidReq, callUnpaid, mockEnv);
   assert(replayRes.status === 403, "Replay attack with consumed nonce is rejected (HTTP 403)");
+
+  // 4d. Production Fail-Closed test: unconfigured recipient or missing settlement facilitator MUST reject even valid EIP-712 sig
+  const prodReq = new Request("https://mock.local/mcp", {
+    method: "POST",
+    headers: {
+      "PAYMENT-SIGNATURE": validPaymentPayload,
+      "x402-nonce": "prod-fail-closed-nonce",
+    },
+  });
+  const prodRes = await handleJsonRpc(prodReq, callUnpaid, prodFailClosedEnv);
+  assert(
+    prodRes.status === 403,
+    "Production fail-closed rejects empty-wallet sig without settlement facilitator (HTTP 403)"
+  );
+
+  const prodValidRecipientNoCdpEnv: Env = {
+    ...prodFailClosedEnv,
+    PAYMENT_RECIPIENT_EVM: "0x1234567890123456789012345678901234567890",
+  };
+  const prodNoCdpRes = await handleJsonRpc(prodReq, callUnpaid, prodValidRecipientNoCdpEnv);
+  assert(
+    prodNoCdpRes.status === 403,
+    "Production fail-closed rejects request when COINBASE_CDP_API_KEY is missing (HTTP 403)"
+  );
 
   console.log(`\n========================================`);
   console.log(`Results: ${passed} Passed, ${failed} Failed`);

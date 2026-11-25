@@ -4,6 +4,7 @@ compatibility_date = "2024-09-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
+ENVIRONMENT = "production" # Fail-closed production hold (mock signatures strictly rejected)
 PAYMENT_RECIPIENT_EVM = "0x0000000000000000000000000000000000000000" # Заменяется на ваш адрес кошелька Base
 PAYMENT_RECIPIENT_SOLANA = "" # Опциональный адрес Solana (SPL USDC)
 PAYMENT_AMOUNT_USDC = "0.005"
